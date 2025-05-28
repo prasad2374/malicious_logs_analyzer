@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 from datetime import timedelta
+from collections import defaultdict
 
 # --- Utility functions ---
 def parse_time_window(window_str):
@@ -26,7 +27,6 @@ def filter_time_window(df, col, window_str):
 def apply_match_pattern(df, pattern):
     for k, v in pattern.items():
         if k not in df.columns:
-            # Column missing; no matches possible
             return pd.DataFrame()
         df = df[df[k].astype(str) == str(v)]
         if df.empty:
@@ -34,10 +34,8 @@ def apply_match_pattern(df, pattern):
     return df
 
 def group_and_aggregate(df, group_by, threshold):
-    # Support group_by as str or list
     if isinstance(group_by, str):
         group_by = [group_by]
-
     grouped = df.groupby(group_by).size().reset_index(name="count")
     filtered_grouped = grouped[grouped["count"] >= threshold]
     return filtered_grouped
@@ -46,13 +44,39 @@ def display_alert(st, rule, count, group_val=None):
     group_info = f"\n🧍 Group: `{group_val}`" if group_val else ""
     severity = rule.get("action", {}).get("severity", "medium")
     message = rule.get("action", {}).get("message", "")
+    stride = rule.get("stride", "Unknown")
+    dread = rule.get("dread", {})
+    dread_score = sum(dread.values()) / 5 if dread else "N/A"
+
     st.error(f"""
 🚨 **{rule['name']}**  
 🆔 Rule ID: `{rule['rule_id']}`  
 🔥 Severity: **{severity}**  
 💬 {message}  
-🧮 Count: **{count}**{group_info}
+🧮 Count: **{count}**{group_info}  
+🛡 STRIDE: `{stride}`  
+📊 DREAD Score: `{dread_score}`
 """)
+
+# --- Chain of Events Detection ---
+def detect_chains(df, chain_rules):
+    st.subheader("🔗 Chain of Events Alerts")
+    chains_triggered = False
+    for chain in chain_rules:
+        chain_name = chain.get("name", "Unnamed Chain")
+        events = chain.get("events", [])
+        min_occurrences = chain.get("min_occurrences", 1)
+        matched = True
+        for evt in events:
+            matched_df = apply_match_pattern(df, evt)
+            if matched_df.empty:
+                matched = False
+                break
+        if matched:
+            st.warning(f"⚠️ Chain Alert: **{chain_name}** triggered by sequence of matching events.")
+            chains_triggered = True
+    if not chains_triggered:
+        st.success("✅ No chain of event alerts triggered.")
 
 # --- Rule engine ---
 def apply_rules(df, rules, log_source, threshold_overrides):
@@ -108,7 +132,6 @@ if uploaded_log:
             st.warning("Missing 'timestamp'. Adding current UTC time to all entries.")
             df_logs["timestamp"] = pd.Timestamp.utcnow()
         else:
-            # Parse timestamps with UTC timezone, coerce errors
             df_logs["timestamp"] = pd.to_datetime(df_logs["timestamp"], utc=True, errors='coerce')
             if df_logs["timestamp"].isnull().any():
                 st.warning("Some timestamps could not be parsed and were set to current UTC time.")
@@ -125,20 +148,21 @@ else:
 if uploaded_rules:
     try:
         rule_data = json.loads(uploaded_rules.read().decode("utf-8"))
-        if isinstance(rule_data, list):
-            rules = rule_data
-        elif isinstance(rule_data, dict):
+        if isinstance(rule_data, dict):
             rules = rule_data.get("rules", [])
+            chain_rules = rule_data.get("chains", [])
         else:
-            rules = []
+            rules = rule_data
+            chain_rules = []
         st.success("✅ Rules loaded.")
     except Exception as e:
         st.error(f"Error parsing rules: {e}")
         rules = []
+        chain_rules = []
 else:
     rules = []
+    chain_rules = []
 
-# --- Rule Threshold Controls ---
 threshold_overrides = {}
 if rules:
     st.sidebar.header("🔧 Rule Threshold Overrides")
@@ -153,7 +177,7 @@ if rules:
                 step=1
             )
 
-# --- Apply rules if all data is available ---
 if not df_logs.empty and rules:
     log_type_guess = st.selectbox("Select log source type:", ["auth_logs", "network_logs"])
     apply_rules(df_logs, rules, log_type_guess, threshold_overrides)
+    detect_chains(df_logs, chain_rules)
